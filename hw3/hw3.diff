@@ -1,0 +1,498 @@
+diff --git a/hw3.diff b/hw3.diff
+new file mode 100644
+index 000000000000..9757fd271ad9
+--- /dev/null
++++ b/hw3.diff
+@@ -0,0 +1,236 @@
++diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
++index f7c561c4dcdd..70aa0d1f3ae7 100644
++--- a/include/linux/syscalls.h
+++++ b/include/linux/syscalls.h
++@@ -1421,4 +1421,16 @@ long compat_ksys_semtimedop(int semid, struct sembuf __user *tsems,
++ 			    unsigned int nsops,
++ 			    const struct old_timespec32 __user *timeout);
++ 
+++struct expose_pte_args {
+++	pid_t pid;
+++	unsigned long begin_fpt_vaddr;
+++	unsigned long end_fpt_vaddr;
+++	unsigned long begin_pte_vaddr;
+++	unsigned long end_pte_vaddr;
+++	unsigned long begin_vaddr;
+++	unsigned long end_vaddr;
+++};
+++
+++asmlinkage long sys_expose_pte(struct expose_pte_args __user *args);
+++
++ #endif
++diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
++index 1fc8faa6e973..15a19fd8d3e6 100644
++--- a/include/uapi/asm-generic/unistd.h
+++++ b/include/uapi/asm-generic/unistd.h
++@@ -851,8 +851,11 @@ __SYSCALL(__NR_pidfd_open, sys_pidfd_open)
++ __SYSCALL(__NR_clone3, sys_clone3)
++ #endif
++ 
+++#define __NR_expose_pte 436
+++__SYSCALL(__NR_expose_pte, sys_expose_pte)
+++
++ #undef __NR_syscalls
++-#define __NR_syscalls 436
+++#define __NR_syscalls 437
++ 
++ /*
++  * 32 bit systems traditionally used different
++diff --git a/kernel/sys.c b/kernel/sys.c
++index a611d1d58c7d..e2191d0e11f4 100644
++--- a/kernel/sys.c
+++++ b/kernel/sys.c
++@@ -64,12 +64,17 @@
++ #include <linux/nospec.h>
++ 
++ #include <linux/kmsg_dump.h>
+++
+++/* pmd_huge */
+++#include <linux/hugetlb.h>
+++
++ /* Move somewhere else to avoid recompiling? */
++ #include <generated/utsrelease.h>
++ 
++ #include <linux/uaccess.h>
++ #include <asm/io.h>
++ #include <asm/unistd.h>
+++#include <asm/pgtable-types.h>
++ 
++ #include "uid16.h"
++ 
++@@ -2648,4 +2653,175 @@ COMPAT_SYSCALL_DEFINE1(sysinfo, struct compat_sysinfo __user *, info)
++ 
++ 	return 0;
++ }
+++
+++
+++/*page table walk*/
+++int find_pte(struct task_struct *p, unsigned long input_addr,
+++	     unsigned long *ptetlb_pfn)
+++{
+++	pgd_t *pgd;
+++	pud_t *pud;
+++	pmd_t *pmd;
+++	pte_t *pte;
+++
+++	struct mm_struct *mm = p->mm;
+++
+++	pgd = pgd_offset(mm, input_addr);
+++//	printk(KERN_INFO "\npgd is: %p\n", (void *)pgd);
+++//	printk(KERN_INFO "pgd value: %llx\n", *pgd);
+++	if (pgd_none(*pgd) || pgd_bad(*pgd))
+++		return -EFAULT; //This should change to error macro.
+++	pud = pud_offset(pgd, input_addr);
+++//	printk(KERN_INFO "\npud is: %p\n", (void *)pud);
+++//	printk(KERN_INFO "pud value: %llx\n", *pud);
+++	if (pud_none(*pud) || pud_bad(*pud))
+++		return -EFAULT; //This should change to error macro.
+++	pmd = pmd_offset(pud, input_addr);
+++//	printk(KERN_INFO "\npmd is: %p\n", (void *)pmd);
+++//	printk(KERN_INFO "pmd value: %llx\n", *pmd);
+++	if (pmd_none(*pmd) || pmd_bad(*pmd))
+++		return -EFAULT; //This should change to error macro.
+++	pte = pte_offset_kernel(pmd, input_addr);
+++//	printk(KERN_INFO "\npte is: %p\n", (void *)pte);
+++//	printk(KERN_INFO "pte value: %llx\n", *pte);
+++	if (!pte)
+++		return -EFAULT; //This should change to error macro.
+++	(*ptetlb_pfn) = pmd_offset_phys(pud, input_addr);
+++	//	printk(KERN_INFO "pfn : %lx\n", *ptetlb_pfn);
+++	//	printk(KERN_INFO "pfn : %lx\n", __pa(pmd));
+++	return 0;
+++}
+++
+++
+++SYSCALL_DEFINE1(expose_pte,
+++		struct expose_pte_args __user *, args)
+++{
+++	//handle system call
+++	struct task_struct *p = NULL;
+++
+++	for_each_process(p) {
+++		if (p->pid == args->pid)
+++			break;
+++	}
+++
+++	//printk(KERN_ALERT"PID:%d\n", p->pid);
+++
+++	struct expose_pte_args k_args;
+++
+++	if (copy_from_user(&k_args, (void __user *)args,
+++		sizeof(k_args)) != 0) {
+++	//	printk(KERN_INFO "error\n");
+++		return -EFAULT;
+++	}
+++
+++	//printk(KERN_INFO "begin : %lx\n", k_args.begin_vaddr);
+++	//printk(KERN_INFO "end : %lx\n", k_args.end_vaddr);
+++
+++	//Check if there has enough reserved memory space.
+++	struct vm_area_struct *vma;
+++
+++	vma = current->mm->mmap;
+++	struct vm_area_struct *ftp_vma = find_vma(current->mm,
+++					k_args.begin_fpt_vaddr);
+++	struct vm_area_struct *pte_vma = find_vma(current->mm,
+++					k_args.begin_pte_vaddr);
+++
+++
+++	if (ftp_vma == NULL) {
+++		//printk(KERN_INFO "no reserved for f_table\n");
+++		return -EFAULT;
+++	}
+++	if (pte_vma == NULL) {
+++		//printk(KERN_INFO "no reserved for remapped_table\n");
+++		return -EFAULT;
+++	}
+++
+++	//printk(KERN_INFO "ftp_vma start %lx\n", ftp_vma->vm_start);
+++	//printk(KERN_INFO "ftp_vma end %lx\n", ftp_vma->vm_end);
+++	//printk(KERN_INFO "pte_vma start %lx\n", pte_vma->vm_start);
+++	//printk(KERN_INFO "pte_vma end %lx\n", pte_vma->vm_end);
+++
+++	unsigned long index = 0;
+++	unsigned long remap_point = pte_vma->vm_start;
+++	size_t ftb_entries = (k_args.end_vaddr - k_args.begin_vaddr) /
+++				PAGE_SIZE;
+++
+++	//printk(KERN_INFO "No. of ftb_entries : %d\n", ftb_entries);
+++
+++	unsigned long *flattened_table = kmalloc_array(ftb_entries,
+++					 sizeof(unsigned long),
+++					 GFP_USER);
+++
+++	if (!flattened_table) {
+++		//printk(KERN_INFO "kmalloc_arr failed\n");
+++		return -EFAULT;
+++	}
+++
+++	int i = 0;
+++	unsigned long last_pte_pfn = 0;
+++
+++	for (index = k_args.begin_vaddr; index < k_args.end_vaddr;
+++			i++, index += PAGE_SIZE){
+++
+++		unsigned long the_pte_pfn = 0;
+++
+++		//If input va has pte table.
+++		int ret_find_pte = find_pte(p, index, &the_pte_pfn);
+++
+++		if (ret_find_pte == 0) {
+++			//printk(KERN_INFO "find pte pfn %lx\n", the_pte_pfn);
+++
+++			if (the_pte_pfn == last_pte_pfn) {
+++				*(flattened_table+i) = *(flattened_table+i-1);
+++			} else {
+++				//According to the source code comment.
+++				//We should acquire mm semaphore before
+++				//calling remap_pfn_range.
+++				struct mm_struct *mm = pte_vma->vm_mm;
+++
+++				down_write(&mm->mmap_sem);
+++				int ret = remap_pfn_range(pte_vma, remap_point,
+++						the_pte_pfn >> PAGE_SHIFT,
+++						4096, pte_vma->vm_page_prot);
+++				up_write(&mm->mmap_sem);
+++				if (ret != 0) {
+++					//printk(KERN_INFO "remap failed\n");
+++					return -EFAULT;
+++				}
+++				//printk(KERN_INFO "assign ftb entry\n");
+++				//assign remap_point to f table entry.
+++				*(flattened_table + i) = remap_point;
+++				//Update last_pte_pfn
+++				last_pte_pfn = the_pte_pfn;
+++				//Update remap_point in vma
+++				remap_point += 4096;
+++				if (remap_point > pte_vma->vm_end) {
+++					//printk(KERN_INFO
+++					//"exceed reserved space.\n");
+++					return -EFAULT;
+++				}
+++			}
+++
+++		} else { //Find no pte
+++			//assign 0 to f table entry.
+++			*(flattened_table + i) = 0;
+++		}
+++	}
+++
+++	phys_addr_t f_table_phys = virt_to_phys(flattened_table);
+++	//printk(KERN_INFO "f_rable pfn : %lx\n", f_table_phys);
+++	if (remap_pfn_range(ftp_vma, ftp_vma->vm_start,
+++	    f_table_phys >> PAGE_SHIFT,
+++	    (ftp_vma->vm_end - ftp_vma->vm_start),
+++	    ftp_vma->vm_page_prot) != 0) {
+++		//printk(KERN_INFO "remap f_table failed\n");
+++		return -EFAULT;
+++	}
+++	//debugging.
+++	//for(i = 0; i < ftb_entries; i++){
+++	//	printk(KERN_INFO "ftb entry : %lx\n", *(flattened_table+i));
+++	//}
+++	return 0;
+++}
+++
++ #endif /* CONFIG_COMPAT */
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index f7c561c4dcdd..70aa0d1f3ae7 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1421,4 +1421,16 @@ long compat_ksys_semtimedop(int semid, struct sembuf __user *tsems,
+ 			    unsigned int nsops,
+ 			    const struct old_timespec32 __user *timeout);
+ 
++struct expose_pte_args {
++	pid_t pid;
++	unsigned long begin_fpt_vaddr;
++	unsigned long end_fpt_vaddr;
++	unsigned long begin_pte_vaddr;
++	unsigned long end_pte_vaddr;
++	unsigned long begin_vaddr;
++	unsigned long end_vaddr;
++};
++
++asmlinkage long sys_expose_pte(struct expose_pte_args __user *args);
++
+ #endif
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 1fc8faa6e973..15a19fd8d3e6 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -851,8 +851,11 @@ __SYSCALL(__NR_pidfd_open, sys_pidfd_open)
+ __SYSCALL(__NR_clone3, sys_clone3)
+ #endif
+ 
++#define __NR_expose_pte 436
++__SYSCALL(__NR_expose_pte, sys_expose_pte)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls 436
++#define __NR_syscalls 437
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/kernel/sys.c b/kernel/sys.c
+index a611d1d58c7d..048d32aa11fe 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -64,12 +64,17 @@
+ #include <linux/nospec.h>
+ 
+ #include <linux/kmsg_dump.h>
++
++/* pmd_huge */
++#include <linux/hugetlb.h>
++
+ /* Move somewhere else to avoid recompiling? */
+ #include <generated/utsrelease.h>
+ 
+ #include <linux/uaccess.h>
+ #include <asm/io.h>
+ #include <asm/unistd.h>
++#include <asm/pgtable-types.h>
+ 
+ #include "uid16.h"
+ 
+@@ -2648,4 +2653,180 @@ COMPAT_SYSCALL_DEFINE1(sysinfo, struct compat_sysinfo __user *, info)
+ 
+ 	return 0;
+ }
++
++
++/*page table walk*/
++int find_pte(struct task_struct *p, unsigned long input_addr,
++	     unsigned long *ptetlb_pfn, unsigned long *pte_offset)
++{
++	pgd_t *pgd;
++	pud_t *pud;
++	pmd_t *pmd;
++	pte_t *pte;
++	struct mm_struct *mm = p->mm;
++
++	pgd = pgd_offset(mm, input_addr);
++//	printk(KERN_INFO "\npgd is: %p\n", (void *)pgd);
++//	printk(KERN_INFO "pgd value: %llx\n", *pgd);
++	if (pgd_none(*pgd) || pgd_bad(*pgd))
++		return -1; //This should change to error macro.
++	pud = pud_offset(pgd, input_addr);
++//	printk(KERN_INFO "\npud is: %p\n", (void *)pud);
++//	printk(KERN_INFO "pud value: %llx\n", *pud);
++	if (pud_none(*pud) || pud_bad(*pud))
++		return -1; //This should change to error macro.
++	pmd = pmd_offset(pud, input_addr);
++//	printk(KERN_INFO "\npmd is: %p\n", (void *)pmd);
++//	printk(KERN_INFO "pmd value: %llx\n", *pmd);
++	if (pmd_none(*pmd) || pmd_bad(*pmd))
++		return -1; //This should change to error macro.
++	pte = pte_offset_kernel(pmd, input_addr);
++//	printk(KERN_INFO "\npte is: %p\n", (void *)pte);
++//	printk(KERN_INFO "pte value: %llx\n", *pte);
++	if (!pte)
++		return -1; //This should change to error macro.
++	(*ptetlb_pfn) = pmd_page_paddr(*pmd) >> PAGE_SHIFT;
++	return 0;
++}
++
++
++SYSCALL_DEFINE1(expose_pte,
++		struct expose_pte_args __user *, args)
++{
++	//handle system call
++	struct task_struct *p = NULL;
++	int i = 0;
++	unsigned long last_pte_pfn = 1;
++	unsigned long offset = 0;
++	unsigned long pte_os = 0;
++	struct expose_pte_args k_args;
++	struct vm_area_struct *vma;
++	unsigned long index = 0;
++	int ret = 0;
++	unsigned long the_pte_pfn = 0;
++	int ret_find_pte = 0;
++	struct vm_area_struct *ftp_vma;
++	struct vm_area_struct *pte_vma;
++	unsigned long remap_point;
++	size_t ftb_entries;
++	unsigned long *flattened_table;
++	phys_addr_t f_table_phys;
++
++	for_each_process(p) {
++		if (p->pid == args->pid)
++			break;
++	}
++
++	//printk(KERN_ALERT"PID:%d\n", p->pid);
++
++
++	if (copy_from_user(&k_args, (void __user *)args,
++		sizeof(k_args)) != 0) {
++	//	printk(KERN_INFO "error\n");
++		return -EFAULT;
++	}
++
++	//printk(KERN_INFO "begin : %lx\n", k_args.begin_vaddr);
++	//printk(KERN_INFO "end : %lx\n", k_args.end_vaddr);
++
++	//Check if there has enough reserved memory space.
++
++	vma = current->mm->mmap;
++        ftp_vma	= find_vma(current->mm, k_args.begin_fpt_vaddr);
++	pte_vma = find_vma(current->mm, k_args.begin_pte_vaddr);
++
++
++	if (ftp_vma == NULL) {
++		//printk(KERN_INFO "no reserved for f_table\n");
++		return -EFAULT;
++	}
++	if (pte_vma == NULL) {
++		//printk(KERN_INFO "no reserved for remapped_table\n");
++		return -EFAULT;
++	}
++
++	//printk(KERN_INFO "ftp_vma start %lx\n", ftp_vma->vm_start);
++	//printk(KERN_INFO "ftp_vma end %lx\n", ftp_vma->vm_end);
++	//printk(KERN_INFO "pte_vma start %lx\n", pte_vma->vm_start);
++	//printk(KERN_INFO "pte_vma end %lx\n", pte_vma->vm_end);
++
++        remap_point = pte_vma->vm_start;
++	ftb_entries = (k_args.end_vaddr - k_args.begin_vaddr) /
++				PAGE_SIZE;
++
++	//printk(KERN_INFO "No. of ftb_entries : %d\n", ftb_entries);
++
++	flattened_table = kmalloc(ftb_entries*
++			sizeof(unsigned long), GFP_USER);
++	
++	if (!flattened_table) {
++		//printk(KERN_INFO "kmalloc_arr failed\n");
++		return -EFAULT;
++	}
++
++
++	for (index = k_args.begin_vaddr; index < k_args.end_vaddr;
++			i++, offset++, index += PAGE_SIZE){
++
++		//If input va has pte table.
++		ret_find_pte = find_pte(p, index, &the_pte_pfn, &pte_os);
++
++		if (ret_find_pte == 0) {
++
++			if (the_pte_pfn == last_pte_pfn) {
++				*(flattened_table+i) = remap_point - 4096 +
++								offset * 8;
++			} else {
++				//According to the source code comment.
++				//We should acquire mm semaphore before
++				//calling remap_pfn_range.
++				struct mm_struct *mm = pte_vma->vm_mm;
++
++				down_write(&mm->mmap_sem);
++				ret = remap_pfn_range(pte_vma, remap_point,
++						the_pte_pfn,
++						4096, pte_vma->vm_page_prot);
++				up_write(&mm->mmap_sem);
++				//pr_err("remap S\n");
++				if (ret != 0) {
++					pr_err("remap failed\n");
++					return -EFAULT;
++				}
++				offset = 0;
++				//printk(KERN_INFO "assign ftb entry\n");
++				//assign remap_point to f table entry.
++				*(flattened_table + i) = remap_point;
++				//Update last_pte_pfn
++				last_pte_pfn = the_pte_pfn;
++				//Update remap_point in vma
++				remap_point += 4096;
++				if (remap_point > pte_vma->vm_end) {
++					pr_err("exceed reserved space.\n");
++					return -EFAULT;
++				}
++			}
++
++
++		} else { //Find no pte
++			//assign 0 to f table entry.
++			*(flattened_table + i) = 0;
++		}
++	}
++	if (remap_point == pte_vma->vm_start) {
++//		pr_err("no found\n");
++		return -EFAULT;
++	}
++
++	f_table_phys = virt_to_phys(flattened_table);
++	//down_write(&ftp_mm->mmap_sem);
++	if (remap_pfn_range(ftp_vma, ftp_vma->vm_start,
++	    f_table_phys >> PAGE_SHIFT,
++	    ftp_vma->vm_end - ftp_vma->vm_start,
++	    ftp_vma->vm_page_prot) != 0) {
++		return -EFAULT;
++	}
++	//up_write(&ftp_mm->mmap_sem);
++	return 0;
++}
++
+ #endif /* CONFIG_COMPAT */
+diff --git a/writeup.md b/writeup.md
+new file mode 100644
+index 000000000000..122746629eaa
+--- /dev/null
++++ b/writeup.md
+@@ -0,0 +1,9 @@
++compile : git apply patch and then use makefile in the file to generate test binary
++execute : ./inspection -i pid begin_va end_va
++explanation : First copy args from user space, then find reserved vma. Use kmalloc_array to malloc ftlb, then find pte table by given VA. find_pte find given va's pte table's pfn.
++remap pte table if found and construct ftlb in the for loop. Finally, remap ftlb. find_pte use kernel function to check whether the va has pa or not, if found, then return pte's pfn.
++contribution :  
++	r10944064:system call
++	r09944064:system call/inspection
++	r10922172:inspection
++ref:https://www.zendei.com/article/41768.html

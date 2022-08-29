@@ -1,0 +1,883 @@
+diff --git a/fs/Kconfig b/fs/Kconfig
+index 2501e6f1f965..7a64e3cb4826 100644
+--- a/fs/Kconfig
++++ b/fs/Kconfig
+@@ -152,6 +152,7 @@ menu "Pseudo filesystems"
+ source "fs/proc/Kconfig"
+ source "fs/kernfs/Kconfig"
+ source "fs/sysfs/Kconfig"
++source "fs/seccompfs/Kconfig"
+ 
+ config TMPFS
+ 	bool "Tmpfs virtual memory file system support (former shm fs)"
+diff --git a/fs/Makefile b/fs/Makefile
+index 14231b4cf383..ae3e85537010 100644
+--- a/fs/Makefile
++++ b/fs/Makefile
+@@ -4,7 +4,7 @@
+ #
+ # 14 Sep 2000, Christoph Hellwig <hch@infradead.org>
+ # Rewritten to use lists instead of if-statements.
+-# 
++#
+ 
+ obj-y :=	open.o read_write.o file_table.o super.o \
+ 		char_dev.o stat.o exec.o pipe.o namei.o fcntl.o \
+@@ -65,7 +65,7 @@ obj-y				+= devpts/
+ 
+ obj-$(CONFIG_PROFILING)		+= dcookies.o
+ obj-$(CONFIG_DLM)		+= dlm/
+- 
++
+ # Do not add any filesystems before this line
+ obj-$(CONFIG_FSCACHE)		+= fscache/
+ obj-$(CONFIG_REISERFS_FS)	+= reiserfs/
+@@ -132,3 +132,4 @@ obj-$(CONFIG_CEPH_FS)		+= ceph/
+ obj-$(CONFIG_PSTORE)		+= pstore/
+ obj-$(CONFIG_EFIVAR_FS)		+= efivarfs/
+ obj-$(CONFIG_EROFS_FS)		+= erofs/
++obj-$(CONFIG_SECCOMP_FS)	+= seccompfs/
+diff --git a/fs/read_write.c b/fs/read_write.c
+index 5bbf587f5bc1..e897a76360be 100644
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -487,7 +487,7 @@ static ssize_t new_sync_write(struct file *filp, const char __user *buf, size_t
+ 	return ret;
+ }
+ 
+-static ssize_t __vfs_write(struct file *file, const char __user *p,
++ssize_t __vfs_write(struct file *file, const char __user *p,
+ 			   size_t count, loff_t *pos)
+ {
+ 	if (file->f_op->write)
+diff --git a/fs/seccompfs/Kconfig b/fs/seccompfs/Kconfig
+new file mode 100644
+index 000000000000..40b9da396462
+--- /dev/null
++++ b/fs/seccompfs/Kconfig
+@@ -0,0 +1,5 @@
++config SECCOMP_FS
++	bool "seccomp file system support"
++	default y
++	select KERNFS
++	help
+diff --git a/fs/seccompfs/Makefile b/fs/seccompfs/Makefile
+new file mode 100644
+index 000000000000..7064b0e5d119
+--- /dev/null
++++ b/fs/seccompfs/Makefile
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: GPL-2.0
++# #
++# # Makefile for feccompfs filesystem.
++# #
++#
++obj-y += root.o
+diff --git a/fs/seccompfs/internal.h b/fs/seccompfs/internal.h
+new file mode 100644
+index 000000000000..8df2fa61934f
+--- /dev/null
++++ b/fs/seccompfs/internal.h
+@@ -0,0 +1,18 @@
++#include <linux/fs.h>
++#include <linux/types.h>
++#include <linux/proc_fs.h>
++#include <linux/proc_ns.h>
++#include <linux/refcount.h>
++#include <linux/spinlock.h>
++#include <linux/atomic.h>
++#include <linux/binfmts.h>
++#include <linux/sched/coredump.h>
++#include <linux/sched/task.h>
++//#include <seccompfs-bpf.h>
++
++#define ROOT_INO 1
++#define SEC_SUPER_MAGIC 10
++extern long seccomp_set_mode_filter(unsigned int flags,
++		const char __user *filter, struct task_struct *task);
++extern ssize_t __vfs_write(struct file *file, const char __user *p,
++					   size_t count, loff_t *pos);
+diff --git a/fs/seccompfs/root.c b/fs/seccompfs/root.c
+new file mode 100644
+index 000000000000..1e0bee1b8570
+--- /dev/null
++++ b/fs/seccompfs/root.c
+@@ -0,0 +1,569 @@
++#include <linux/fs.h>
++#include <linux/fs_context.h>
++#include <linux/kernel.h>
++#include <linux/magic.h>
++#include <linux/slab.h>
++#include <linux/stat.h>
++#include <linux/string.h>
++#include <linux/ctype.h>
++#include <linux/time.h>
++#include <uapi/linux/mount.h>
++#include <linux/user_namespace.h>
++#include <linux/pid_namespace.h>
++#include "internal.h"
++#include <linux/seq_file.h>
++#include <uapi/linux/filter.h>
++
++static const struct super_operations seccompfs_sops;
++static const struct inode_operations seccompfs_inode_ops;
++static const struct file_operations seccompfs_dir_ops;
++static const struct file_operations sec_file_ops;
++static const struct file_operations sec_log_file_ops;
++
++
++static const struct address_space_operations seccompfs_aops;
++static pid_t filtered[100]; //filtered pid
++static struct file *filp[100];
++static int config_info[100];
++
++static pid_t log_pid;
++static int pid_cnt;
++
++
++//static char log_info[100][60000];
++static int log_offset[100];
++
++void store_log(pid_t pid, int pidcnt, int syscall, int filter)
++{
++	mm_segment_t old_fs;
++	char buf[15];
++	char path[100];
++	int ret = 0;
++	struct file *fp;
++	loff_t pos;
++
++	memset(buf, 0, sizeof(buf));
++	sprintf(path, "/mnt/%d/log", pid);
++	fp = filp_open(path, O_RDONLY, 0);
++	if (!fp)
++		pr_err("file open error\n");
++
++	sprintf(buf, "%d, %x\n", syscall, filter);
++	old_fs = get_fs();
++	set_fs(KERNEL_DS);
++	pos = fp->f_pos;
++	pos += log_offset[pidcnt];
++	__sb_start_write(file_inode(fp)->i_sb, SB_FREEZE_WRITE, true);
++	ret = __vfs_write(fp, buf, sizeof(buf), &pos);
++	__sb_end_write(file_inode(fp)->i_sb, SB_FREEZE_WRITE);
++	log_offset[pidcnt] += sizeof(buf);
++	//pr_err("%d\n", ret);
++	set_fs(old_fs);
++	filp_close(fp, NULL);
++}
++
++void store_filter(pid_t pid, int syscall, int filter)
++{
++	int i = 0;
++
++	while (i < pid_cnt) {
++		if (pid == filtered[i]) {
++//			pr_err("Pid: %d, syscall: %d, %x\n",
++//							pid, syscall, filter);
++			store_log(pid, i, syscall, filter);
++			//break;
++		}
++		i++;
++	}
++}
++
++struct seccompfs_fs_context {
++	struct pid_namespace	*pid_ns;
++	//unsigned int		mask;
++	//int			hidepid;
++	//int			gid;
++};
++
++//attach system call filter to task.
++static int install_filter(struct task_struct *task)
++{
++	int ret;
++	int i, j;
++	int len = config_info[0];
++	unsigned int flags = SECCOMP_FILTER_FLAG_LOG;
++	mm_segment_t old_fs;
++
++	struct sock_filter *filter = (struct sock_filter *)
++		kmalloc(sizeof(struct sock_filter)*(len*2+2), GFP_KERNEL);
++
++	struct sock_fprog prog = {
++		.len = len*2+2,
++		.filter = filter,
++	};
++
++	struct sock_filter load_syscall = BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
++					(offsetof(struct seccomp_data, nr)));
++	struct sock_filter kill_thread = BPF_STMT(BPF_RET | BPF_K,
++						SECCOMP_RET_KILL_THREAD);
++
++	filter[0] = load_syscall;
++
++	for (i = 1, j = 1; i < len + 1; i++, j += 2) {
++		struct sock_filter compare_syscall = BPF_JUMP(BPF_JMP |
++					BPF_JEQ | BPF_K, config_info[i], 0, 1);
++		struct sock_filter allow_syscall = BPF_STMT(BPF_RET | BPF_K,
++					SECCOMP_RET_ALLOW);
++
++		filter[j] = compare_syscall;
++		filter[j+1] = allow_syscall;
++	}
++
++	filter[j] = kill_thread;
++
++	old_fs = get_fs();
++	set_fs(KERNEL_DS);
++	ret = seccomp_set_mode_filter(flags, (char *)&prog, task);
++	set_fs(old_fs);
++
++	if (ret) {
++		pr_err("seccomp\n");
++		return ret;
++	}
++
++	return 0;
++}
++
++struct inode *sec_get_inode(struct super_block *sb, umode_t mode)
++{
++	struct inode *inode = new_inode(sb);
++
++	if (!inode) {
++		pr_err("inode create fail\n");
++		return NULL;
++	}
++	inode->i_ino = get_next_ino();
++	inode->i_mtime = inode->i_atime = inode->i_ctime = current_time(inode);
++	if (mode == (S_IFDIR | 0755)) {
++		inode->i_op = &seccompfs_inode_ops;
++		inode->i_fop = &seccompfs_dir_ops;
++
++		inode->i_mode = mode;
++		set_nlink(inode, 2);
++	} else if (mode == (S_IFREG | 0200)) {
++		inode->i_op = &seccompfs_inode_ops;
++		inode->i_fop = &sec_file_ops;
++		inode->i_mapping->a_ops = &seccompfs_aops;
++
++		inode->i_mode = mode;
++		set_nlink(inode, 1);
++	} else if (mode == (S_IFDIR | 0500)) {
++		inode->i_op = &seccompfs_inode_ops;
++		inode->i_fop = &seccompfs_dir_ops;
++
++		inode->i_mode = mode;
++		set_nlink(inode, 2);
++	} else if (mode == (S_IFREG | 0400)) {
++		inode->i_op = &seccompfs_inode_ops;
++		inode->i_fop = &sec_log_file_ops;
++		inode->i_mapping->a_ops = &seccompfs_aops;
++
++		inode->i_mode = mode;
++		set_nlink(inode, 1);
++	}
++
++	return inode;
++}
++
++static int seccompfs_create_log_file(struct super_block *s,
++					struct dentry *dir, const char *name)
++{
++	struct inode *root_inode = d_inode(s->s_root);
++	struct dentry *dentry;
++	struct inode *inode;
++	int ret = -ENOMEM;
++
++	inode_lock(root_inode);
++	dentry = d_alloc_name(dir, name);
++	if (dentry) {
++		inode = sec_get_inode(s, S_IFREG | 0400);
++		d_add(dentry, inode);
++		if (inode)
++			ret = 0;
++		else {
++			dput(dentry);
++			pr_err("can't alloc inode\n");
++		}
++	} else
++		pr_err("can't alloc dentry\n");
++	inode_unlock(root_inode);
++	return ret;
++}
++
++static int seccompfs_create_file(struct super_block *s,
++					struct dentry *dir, const char *name)
++{
++	struct inode *root_inode = d_inode(s->s_root);
++	struct dentry *dentry;
++	struct inode *inode;
++	int ret = -ENOMEM;
++
++	inode_lock(root_inode);
++	dentry = d_alloc_name(dir, name);
++	if (dentry) {
++		inode = sec_get_inode(s, S_IFREG | 0200);
++		d_add(dentry, inode);
++		if (inode)
++			ret = 0;
++		else {
++			dput(dentry);
++			pr_err("can't alloc inode\n");
++		}
++	} else
++		pr_err("can't alloc dentry\n");
++
++	inode_unlock(root_inode);
++	return ret;
++}
++
++static struct dentry *seccompfs_create_dir(struct super_block *s,
++					struct dentry *dir, const char *name)
++{
++	struct inode *root_inode = d_inode(s->s_root);
++	struct dentry *dentry;
++	struct inode *inode;
++	int ret = -ENOMEM;
++
++	inode_lock(root_inode);
++	dentry = d_alloc_name(dir, name);
++	if (dentry) {
++		inode = sec_get_inode(s, S_IFDIR | 0500);
++		d_add(dentry, inode);
++		if (inode)
++			ret = 0;
++		else {
++			dput(dentry);
++			pr_err("can't alloc inode\n");
++		}
++	} else
++		pr_err("can't alloc dentry\n");
++	inode_unlock(root_inode);
++	return dentry;
++}
++
++static int seccompfs_create_files(struct super_block *s, struct dentry *root)
++{
++//	struct dentry *dentry;
++	if (seccompfs_create_file(s, root, "config") != 0)
++		return -ENOMEM;
++	if (seccompfs_create_file(s, root, "begin") != 0)
++		return -ENOMEM;
++	return 0;
++}
++
++
++
++// fc: The filesystem context holding the parameters
++static int seccompfs_fill_super(struct super_block *s, struct fs_context *fc)
++{
++	// Initialize struct super_block here (e.g. s_flags, s_op, s_root, ...)
++	//unsigned long s_flags;
++	struct inode *root_inode;
++	int ret = 0;
++	//fc->root = s;
++	s->s_iflags |= SB_I_USERNS_VISIBLE | SB_I_NOEXEC | SB_I_NODEV;
++	s->s_flags |= SB_NODIRATIME | SB_NOSUID | SB_NOEXEC;
++	s->s_blocksize = PAGE_SIZE;
++	s->s_blocksize_bits = PAGE_SHIFT;
++	s->s_magic = SEC_SUPER_MAGIC;
++
++	s->s_op = &seccompfs_sops;
++
++	s->s_time_gran = 1;
++	//s->s_time_min = EXFAT_MIN_TIMESTAMP_SECS;
++	//s->s_time_max = EXFAT_MAX_TIMESTAMP_SECS;
++
++	root_inode = sec_get_inode(s, S_IFDIR | 0755);
++	if (!root_inode) {
++		pr_err("sec_fill_super: get root inode failed\n");
++		return -ENOMEM;
++	}
++
++	s->s_root = d_make_root(root_inode);
++	if (!s->s_root) {
++		pr_err("sec_fill_super: allocate dentry failed\n");
++		return -ENOMEM;
++	}
++
++	ret = seccompfs_create_files(s, s->s_root);
++
++	return ret;
++}
++
++static const struct super_operations seccompfs_sops = {
++	.statfs		= simple_statfs,
++	//.free_inode	= seccompfs_free_inode,
++	//.alloc_inode	= seccinofs_alloc_inode,
++	// other, 參考ramfs/inode.c , proc/root.c
++};
++
++static const struct inode_operations seccompfs_inode_ops = {
++	.lookup		= simple_lookup,
++	.getattr	= simple_getattr,
++	//.mkdir	= seccompfs_mkdir,
++	//.rmdir		= seccompfs_rmdir,
++	// other, 參考ramfs/ionode.c
++};
++
++static int seccompfs_get_tree(struct fs_context *fc)
++{
++	// Call the appropriate get_tree_ API
++	// check out `get_tree_*` in `fs/super.c`
++	return get_tree_nodev(fc, seccompfs_fill_super);
++}
++
++static const struct fs_context_operations seccompfs_context_ops = {
++	.get_tree	= seccompfs_get_tree,
++};
++
++/*
++ * Filesystem context for holding the parameters used in the creation or
++ * reconfiguration of a superblock.
++ */
++static int seccompfs_init_fs_context(struct fs_context *fc)
++{
++	// Initialize fs_context here (e.g. ops)
++	struct seccompfs_fs_context *ctx;
++
++	ctx = kzalloc(sizeof(struct seccompfs_fs_context), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++
++	ctx->pid_ns = get_pid_ns(task_active_pid_ns(current));
++	put_user_ns(fc->user_ns);
++	fc->user_ns = get_user_ns(ctx->pid_ns->user_ns);
++	fc->fs_private = ctx;
++	fc->ops = &seccompfs_context_ops;
++
++	return 0;
++}
++
++static const struct file_operations seccompfs_dir_ops = {
++	// Define dir operations here (e.g. open, iterate, close, release ...)
++	// check out `fs/libfs.c` and `include/linux/fs.h`
++	//.owner		= THIS_MODULE,
++	.open		= dcache_dir_open,
++	.release	= dcache_dir_close,
++	.llseek		= dcache_dir_lseek,
++	.read		= generic_read_dir,
++	.iterate	= dcache_readdir,
++	.fsync		= noop_fsync,
++};
++
++int isnumber_token(const char *token)
++{
++	int ret = 0;
++	int i;
++
++	i = strlen(token);
++
++	while (i-- && (ret == 0)) {
++		if (*token == '\n')
++			continue;
++		ret = (!isdigit(*token)) ? -ENOMEM : 0;
++		token++;
++	}
++	return ret;
++}
++
++int parse_config(char *input)
++{
++	int ret = 0;
++	int pid = 0;
++	int len = 100;
++	int t = 0;
++	ssize_t size = 0; //number of tokens
++	char * const delim = ",";
++	char *token, *cur = input;
++
++	while ((token = strsep(&cur, delim)) && (ret == 0)) {
++		pr_err("%s\n", token);
++		if (isnumber_token(token) == 0 && (size == 0)) {
++			ret = kstrtoint(token, 10, &pid);
++			size++;
++			continue;
++		}
++
++		if (isnumber_token(token) == 0 && (size == 1)) {
++			ret = kstrtoint(token, 10, &len);
++			size++;
++			continue;
++		}
++
++		if (isnumber_token(token) == 0)
++			ret = kstrtoint(token, 10, &t);
++		else
++			ret = -EINVAL;
++
++		if (t < 436 && t > 0)
++			config_info[size-1] = t;
++		else {
++			pr_err("Invalid system call range\n");
++			ret = -EINVAL;
++		}
++
++		size++;
++	}
++
++	//Some tokens are not number.
++	if (ret < 0) {
++		memset(config_info, 0, sizeof(config_info));
++		return ret;
++	}
++
++	if (size - 2 != len) {
++		memset(config_info, 0, sizeof(config_info));
++		pr_err("number of input system calls did not match LEN.\n");
++		return -EINVAL;
++	}
++	//set first element of config_info to LEN.
++	config_info[0] = len;
++	log_pid = pid;
++	return ret;
++}
++ssize_t check_config_format(char *input)
++{
++	ssize_t ret = 0;
++
++	ret = parse_config(input);
++
++	if (ret < 0)
++		pr_err("Invalid config format\n");
++
++	return ret;
++}
++
++ssize_t check_begin_format(pid_t pid)
++{
++	struct pid *pid_struct = find_get_pid(pid);
++	struct task_struct *task = pid_task(pid_struct, PIDTYPE_PID);
++	ssize_t ret = 0;
++	int i = 0;
++
++	if (task == NULL) {
++		pr_err("The PID is not running\n");
++		return -EINVAL;
++	}
++
++	while (i < pid_cnt) {
++		if (pid == filtered[i]) {
++			pr_err("The PID has filtered\n");
++			return -EINVAL;
++		}
++		i++;
++	}
++
++	ret = install_filter(task);
++
++	if (ret == 0)
++		pr_err("S\n");
++
++	if (ret == -EINVAL)
++		pr_err("Seccomp fails. Invalid filter!\n");
++
++	return ret;
++}
++
++ssize_t seccompfs_write(struct file *fs, const char __user *buf, size_t size,
++		loff_t *ppos)
++{
++	int ret;
++	char input[1024];
++	unsigned char *c = "config";
++	unsigned char *b = "begin";
++	const unsigned char *file_name = fs->f_path.dentry->d_name.name;
++	struct dentry *dentry = NULL;
++	char dirname[10];
++	//struct inode *begin_inode;
++
++	if (!file_name)
++		return -ENOMEM;
++
++	memset(input, 0, sizeof(input));
++	if (copy_from_user(input, buf, size))
++		return -EFAULT;
++
++	if (memcmp(c, file_name, sizeof(unsigned char)*6) == 0) {
++		pr_err("write in config file\n");
++		ret = check_config_format(input);
++	}
++
++	if (memcmp(b, file_name, sizeof(unsigned char)*5) == 0) {
++		pr_err("write in begin file\n");
++		//init = 1;
++		ret = check_begin_format(log_pid);
++		if (ret != 0) {
++			pr_err("check_begin_foramt fail\n");
++			return size;
++		}
++		filp[pid_cnt] = fs;
++		filtered[pid_cnt] = log_pid;
++		pid_cnt++;
++		sprintf(dirname, "%d", log_pid);
++		dentry = seccompfs_create_dir(fs->f_inode->i_sb,
++					fs->f_inode->i_sb->s_root, dirname);
++		if (seccompfs_create_log_file(fs->f_inode->i_sb,
++					 dentry, "log") != 0)
++			return -ENOMEM;
++		//begin_inode = fs->f_inode->i_sb;
++	}
++
++	//	pr_err("%s\n", input);
++	//
++	return size;
++}
++
++static const struct file_operations sec_log_file_ops = {
++	.read_iter      = generic_file_read_iter,
++	.write_iter	= generic_file_write_iter,
++	.fsync		= noop_fsync,
++	.mmap		= generic_file_mmap,
++	.llseek		= generic_file_llseek,
++};
++
++static const struct file_operations sec_file_ops = {
++	.read_iter	= generic_file_read_iter,
++	.write		= seccompfs_write,
++	.fsync		= noop_fsync,
++	.mmap		= generic_file_mmap,
++	.llseek		= generic_file_llseek,
++};
++
++static const struct address_space_operations seccompfs_aops = {
++	.readpage	= simple_readpage,
++	.write_begin	= simple_write_begin,
++	.write_end	= simple_write_end,
++	.set_page_dirty	= __set_page_dirty_no_writeback,
++};
++
++static struct file_system_type seccompfs_type = {
++	.name = "seccompfs",
++	.init_fs_context = seccompfs_init_fs_context,
++	.kill_sb = kill_litter_super,
++	//.fs_flags = FS_USERNS_MOUNT,
++};
++
++static int __init init_seccompfs(void)
++{
++	int ret;
++	struct vfsmount *mount;
++
++	ret = register_filesystem(&seccompfs_type);
++	if (ret < 0)
++		return ret;
++
++	mount = kern_mount(&seccompfs_type);
++	if (IS_ERR(mount))
++		return PTR_ERR(mount);
++	return 0;
++}
++fs_initcall(init_seccompfs);
+diff --git a/kernel/seccomp.c b/kernel/seccomp.c
+index dba52a7db5e8..cab355f63307 100644
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@ -42,6 +42,8 @@
+ #include <linux/uaccess.h>
+ #include <linux/anon_inodes.h>
+ 
++extern void store_filter(pid_t pid, int syscall, int filter);
++
+ enum notify_state {
+ 	SECCOMP_NOTIFY_INIT,
+ 	SECCOMP_NOTIFY_SENT,
+@@ -281,11 +283,12 @@ static u32 seccomp_run_filters(const struct seccomp_data *sd,
+ }
+ #endif /* CONFIG_SECCOMP_FILTER */
+ 
+-static inline bool seccomp_may_assign_mode(unsigned long seccomp_mode)
++static inline bool seccomp_may_assign_mode(unsigned long seccomp_mode,
++					   struct task_struct *task)
+ {
+-	assert_spin_locked(&current->sighand->siglock);
++	assert_spin_locked(&task->sighand->siglock);
+ 
+-	if (current->seccomp.mode && current->seccomp.mode != seccomp_mode)
++	if (task->seccomp.mode && task->seccomp.mode != seccomp_mode)
+ 		return false;
+ 
+ 	return true;
+@@ -508,16 +511,17 @@ seccomp_prepare_user_filter(const char __user *user_filter)
+  *   - in NEW_LISTENER mode: the fd of the new listener
+  */
+ static long seccomp_attach_filter(unsigned int flags,
+-				  struct seccomp_filter *filter)
++				  struct seccomp_filter *filter,
++				  struct task_struct *task)
+ {
+ 	unsigned long total_insns;
+ 	struct seccomp_filter *walker;
+ 
+-	assert_spin_locked(&current->sighand->siglock);
++	assert_spin_locked(&task->sighand->siglock);
+ 
+ 	/* Validate resulting filter length. */
+ 	total_insns = filter->prog->len;
+-	for (walker = current->seccomp.filter; walker; walker = walker->prev)
++	for (walker = task->seccomp.filter; walker; walker = walker->prev)
+ 		total_insns += walker->prog->len + 4;  /* 4 instr penalty */
+ 	if (total_insns > MAX_INSNS_PER_PATH)
+ 		return -ENOMEM;
+@@ -539,8 +543,8 @@ static long seccomp_attach_filter(unsigned int flags,
+ 	 * If there is an existing filter, make it the prev and don't drop its
+ 	 * task reference.
+ 	 */
+-	filter->prev = current->seccomp.filter;
+-	current->seccomp.filter = filter;
++	filter->prev = task->seccomp.filter;
++	task->seccomp.filter = filter;
+ 
+ 	/* Now that the new filter is in place, synchronize to all threads. */
+ 	if (flags & SECCOMP_FILTER_FLAG_TSYNC)
+@@ -587,7 +591,8 @@ void put_seccomp_filter(struct task_struct *tsk)
+ 	__put_seccomp_filter(tsk->seccomp.filter);
+ }
+ 
+-static void seccomp_init_siginfo(kernel_siginfo_t *info, int syscall, int reason)
++static void seccomp_init_siginfo(kernel_siginfo_t *info, int syscall,
++				 int reason)
+ {
+ 	clear_siginfo(info);
+ 	info->si_signo = SIGSYS;
+@@ -649,7 +654,8 @@ static inline void seccomp_log(unsigned long syscall, long signr, u32 action,
+ 		log = requested && seccomp_actions_logged & SECCOMP_LOG_TRACE;
+ 		break;
+ 	case SECCOMP_RET_USER_NOTIF:
+-		log = requested && seccomp_actions_logged & SECCOMP_LOG_USER_NOTIF;
++		log = requested && seccomp_actions_logged &
++			SECCOMP_LOG_USER_NOTIF;
+ 		break;
+ 	case SECCOMP_RET_LOG:
+ 		log = seccomp_actions_logged & SECCOMP_LOG_LOG;
+@@ -680,7 +686,8 @@ static inline void seccomp_log(unsigned long syscall, long signr, u32 action,
+  * to limit the stack allocations too.
+  */
+ static const int mode1_syscalls[] = {
+-	__NR_seccomp_read, __NR_seccomp_write, __NR_seccomp_exit, __NR_seccomp_sigreturn,
++	__NR_seccomp_read, __NR_seccomp_write, __NR_seccomp_exit,
++	__NR_seccomp_sigreturn,
+ 	0, /* null terminated */
+ };
+ 
+@@ -807,6 +814,8 @@ static int __seccomp_filter(int this_syscall, const struct seccomp_data *sd,
+ 	data = filter_ret & SECCOMP_RET_DATA;
+ 	action = filter_ret & SECCOMP_RET_ACTION_FULL;
+ 
++	store_filter(current->pid, this_syscall, action);
++
+ 	switch (action) {
+ 	case SECCOMP_RET_ERRNO:
+ 		/* Set low-order bits as an errno, capped at MAX_ERRNO. */
+@@ -960,7 +969,7 @@ static long seccomp_set_mode_strict(void)
+ 
+ 	spin_lock_irq(&current->sighand->siglock);
+ 
+-	if (!seccomp_may_assign_mode(seccomp_mode))
++	if (!seccomp_may_assign_mode(seccomp_mode, current))
+ 		goto out;
+ 
+ #ifdef TIF_NOTSC
+@@ -1178,7 +1187,7 @@ static __poll_t seccomp_notify_poll(struct file *file,
+ 	poll_wait(file, &filter->notif->wqh, poll_tab);
+ 
+ 	if (mutex_lock_interruptible(&filter->notify_lock) < 0)
+-		return EPOLLERR;
++		return -EPOLLERR;
+ 
+ 	list_for_each_entry(cur, &filter->notif->notifications, list) {
+ 		if (cur->state == SECCOMP_NOTIFY_INIT)
+@@ -1248,14 +1257,16 @@ static struct file *init_listener(struct seccomp_filter *filter)
+  *
+  * Returns 0 on success or -EINVAL on failure.
+  */
+-static long seccomp_set_mode_filter(unsigned int flags,
+-				    const char __user *filter)
++long seccomp_set_mode_filter(unsigned int flags,
++				    const char __user *filter,
++				    struct task_struct *task)
+ {
+ 	const unsigned long seccomp_mode = SECCOMP_MODE_FILTER;
+ 	struct seccomp_filter *prepared = NULL;
+ 	long ret = -EINVAL;
+ 	int listener = -1;
+ 	struct file *listener_f = NULL;
++	//struct task_struct *task=current;
+ 
+ 	/* Validate flags. */
+ 	if (flags & ~SECCOMP_FILTER_FLAG_MASK)
+@@ -1272,10 +1283,11 @@ static long seccomp_set_mode_filter(unsigned int flags,
+ 		return -EINVAL;
+ 
+ 	/* Prepare the new filter before holding any locks. */
++
+ 	prepared = seccomp_prepare_user_filter(filter);
+ 	if (IS_ERR(prepared))
+ 		return PTR_ERR(prepared);
+-
++	//pr_err("A\n");
+ 	if (flags & SECCOMP_FILTER_FLAG_NEW_LISTENER) {
+ 		listener = get_unused_fd_flags(O_CLOEXEC);
+ 		if (listener < 0) {
+@@ -1290,31 +1302,32 @@ static long seccomp_set_mode_filter(unsigned int flags,
+ 			goto out_free;
+ 		}
+ 	}
++	//pr_err("A\n");
+ 
+ 	/*
+ 	 * Make sure we cannot change seccomp or nnp state via TSYNC
+ 	 * while another thread is in the middle of calling exec.
+ 	 */
+ 	if (flags & SECCOMP_FILTER_FLAG_TSYNC &&
+-	    mutex_lock_killable(&current->signal->cred_guard_mutex))
++	    mutex_lock_killable(&task->signal->cred_guard_mutex))
+ 		goto out_put_fd;
+ 
+-	spin_lock_irq(&current->sighand->siglock);
++	spin_lock_irq(&task->sighand->siglock);
+ 
+-	if (!seccomp_may_assign_mode(seccomp_mode))
++	if (!seccomp_may_assign_mode(seccomp_mode, task))
+ 		goto out;
+ 
+-	ret = seccomp_attach_filter(flags, prepared);
++	ret = seccomp_attach_filter(flags, prepared, task);
+ 	if (ret)
+ 		goto out;
+ 	/* Do not free the successfully attached filter. */
+ 	prepared = NULL;
+ 
+-	seccomp_assign_mode(current, seccomp_mode, flags);
++	seccomp_assign_mode(task, seccomp_mode, flags);
+ out:
+-	spin_unlock_irq(&current->sighand->siglock);
++	spin_unlock_irq(&task->sighand->siglock);
+ 	if (flags & SECCOMP_FILTER_FLAG_TSYNC)
+-		mutex_unlock(&current->signal->cred_guard_mutex);
++		mutex_unlock(&task->signal->cred_guard_mutex);
+ out_put_fd:
+ 	if (flags & SECCOMP_FILTER_FLAG_NEW_LISTENER) {
+ 		if (ret) {
+@@ -1332,7 +1345,8 @@ static long seccomp_set_mode_filter(unsigned int flags,
+ }
+ #else
+ static inline long seccomp_set_mode_filter(unsigned int flags,
+-					   const char __user *filter)
++					   const char __user *filter,
++					   struct task_struct *task)
+ {
+ 	return -EINVAL;
+ }
+@@ -1386,7 +1400,7 @@ static long do_seccomp(unsigned int op, unsigned int flags,
+ 			return -EINVAL;
+ 		return seccomp_set_mode_strict();
+ 	case SECCOMP_SET_MODE_FILTER:
+-		return seccomp_set_mode_filter(flags, uargs);
++		return seccomp_set_mode_filter(flags, uargs, current);
+ 	case SECCOMP_GET_ACTION_AVAIL:
+ 		if (flags != 0)
+ 			return -EINVAL;

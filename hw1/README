@@ -1,0 +1,4 @@
+First part modify linux kernel, add system call 436, and I imply system call function in sys.c which return cpuid
+using raw_smp_processor_id(). Use git diff to generate hw1.diff. In shell, use fgets() to read from stdin, chdir() to change path, folk() and execv() to execute, and a signal handler to handle crtl+C. Set argv to max size ARG_MAX = 131072 +1, and some error handle to function and input that might occur problem.
+
+Apply hw1.diff to linux5.4 (arm), and then run the cross compiled shell cs5473_sh.

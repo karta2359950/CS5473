@@ -1,0 +1,31 @@
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 88d8af043f3d..43a0791f5e24 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -2686,6 +2686,7 @@ int find_pte(struct task_struct *p, unsigned long input_addr,
+ 	if (!pte)
+ 		return -1; //This should change to error macro.
+ 	(*ptetlb_pfn) = pmd_page_paddr(*pmd) >> PAGE_SHIFT;
++	(*pte_offset) = (unsigned long)pte_index(input_addr);
+ 	return 0;
+ }
+ 
+@@ -2775,7 +2776,7 @@ SYSCALL_DEFINE1(expose_pte,
+ 
+ 			if (the_pte_pfn == last_pte_pfn) {
+ 				*(flattened_table+i) = remap_point - 4096 +
+-								offset * 8;
++								(pte_os<<3);
+ 			} else {
+ 				//According to the source code comment.
+ 				//We should acquire mm semaphore before
+@@ -2795,7 +2796,8 @@ SYSCALL_DEFINE1(expose_pte,
+ 				offset = 0;
+ 				//printk(KERN_INFO "assign ftb entry\n");
+ 				//assign remap_point to f table entry.
+-				*(flattened_table + i) = remap_point;
++				*(flattened_table + i) = remap_point
++					+ (pte_os << 3);
+ 				//Update last_pte_pfn
+ 				last_pte_pfn = the_pte_pfn;
+ 				//Update remap_point in vma

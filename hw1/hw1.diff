@@ -1,0 +1,43 @@
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index f7c561c4dcdd..e37d01052d44 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1420,5 +1420,6 @@ long ksys_old_shmctl(int shmid, int cmd, struct shmid_ds __user *buf);
+ long compat_ksys_semtimedop(int semid, struct sembuf __user *tsems,
+ 			    unsigned int nsops,
+ 			    const struct old_timespec32 __user *timeout);
++asmlinkage long sys_get_cpuid(void);
+ 
+ #endif
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 1fc8faa6e973..6b95cbc52a25 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -850,9 +850,11 @@ __SYSCALL(__NR_pidfd_open, sys_pidfd_open)
+ #define __NR_clone3 435
+ __SYSCALL(__NR_clone3, sys_clone3)
+ #endif
++#define __NR_get_cpuid 436
++__SYSCALL(__NR_get_cpuid, sys_get_cpuid)
+ 
+ #undef __NR_syscalls
+-#define __NR_syscalls 436
++#define __NR_syscalls 437
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/kernel/sys.c b/kernel/sys.c
+index a611d1d58c7d..621ff9ad462a 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -2648,4 +2648,10 @@ COMPAT_SYSCALL_DEFINE1(sysinfo, struct compat_sysinfo __user *, info)
+ 
+ 	return 0;
+ }
++
++SYSCALL_DEFINE0(get_cpuid)
++{
++	return (long)raw_smp_processor_id();
++}
++
+ #endif /* CONFIG_COMPAT */
